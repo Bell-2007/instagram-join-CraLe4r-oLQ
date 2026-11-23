@@ -69,6 +69,25 @@
     .sub {
       font-size: 0.75rem;
       color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .conn-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #f59e0b;
+      display: inline-block;
+    }
+
+    .conn-dot.online {
+      background: var(--accent);
+    }
+
+    .conn-dot.offline {
+      background: var(--danger);
     }
 
     .nick-box {
@@ -317,7 +336,10 @@
     <header>
       <div class="title-wrap">
         <h1>OPEN 9:00 - 11:00</h1>
-        <span class="sub">Sesión temporal · No se guarda historial</span>
+        <span class="sub">
+          <span class="conn-dot" id="conn-dot"></span>
+          <span id="conn-text">Conectando... · Sin historial</span>
+        </span>
       </div>
       <div class="nick-box">
         <label for="nick-input">Tú:</label>
@@ -357,6 +379,9 @@
   </div>
 
   <script>
+    // Cambia a wss://TU-TUNEL cuando expongas el servidor WebSocket con HTTPS
+    const WS_URL = "ws://localhost:8765";
+
     const chatEl = document.getElementById("chat");
     const emptyStateEl = document.getElementById("empty-state");
     const composerEl = document.getElementById("composer");
@@ -372,6 +397,8 @@
     const recStatusEl = document.getElementById("rec-status");
     const recTimerEl = document.getElementById("rec-timer");
     const cancelRecBtnEl = document.getElementById("cancel-rec-btn");
+    const connDotEl = document.getElementById("conn-dot");
+    const connTextEl = document.getElementById("conn-text");
 
     // Todo vive únicamente en memoria de la pestaña actual
     let pendingPhotoDataUrl = null;
@@ -381,6 +408,81 @@
     let recInterval = null;
     let recSeconds = 0;
     let cancelRecording = false;
+    let socket = null;
+    let reconnectTimeout = null;
+    const seenIds = new Set();
+
+    function setConnectionStatus(state, label) {
+      connDotEl.className = `conn-dot ${state}`;
+      connTextEl.textContent = `${label} · Sin historial`;
+    }
+
+    function connectSocket() {
+      clearTimeout(reconnectTimeout);
+      setConnectionStatus("", "Conectando...");
+
+      try {
+        socket = new WebSocket(WS_URL);
+      } catch {
+        setConnectionStatus("offline", "Sin conexión");
+        reconnectTimeout = setTimeout(connectSocket, 2500);
+        return;
+      }
+
+      socket.onopen = () => {
+        setConnectionStatus("online", "En vivo");
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (!data.id || seenIds.has(data.id)) return;
+          seenIds.add(data.id);
+
+          appendMessage({
+            author: data.author,
+            text: data.text,
+            photoUrl: data.photoUrl,
+            audioUrl: data.audioUrl,
+            mine: false
+          });
+        } catch {
+          // Ignorar paquetes malformados
+        }
+      };
+
+      socket.onclose = () => {
+        setConnectionStatus("offline", "Reconectando...");
+        reconnectTimeout = setTimeout(connectSocket, 2500);
+      };
+
+      socket.onerror = () => {
+        setConnectionStatus("offline", "Error de red");
+      };
+    }
+
+    function sendLiveMessage({ author, text, photoUrl = null, audioUrl = null }) {
+      const id = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      seenIds.add(id);
+
+      appendMessage({
+        author,
+        text,
+        photoUrl,
+        audioUrl,
+        mine: true
+      });
+
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          id,
+          author,
+          text,
+          photoUrl,
+          audioUrl
+        }));
+      }
+    }
 
     function formatTime(date = new Date()) {
       return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -393,7 +495,7 @@
     }
 
     function appendMessage({ author, text, photoUrl, audioUrl, mine = true }) {
-      if (emptyStateEl) {
+      if (emptyStateEl && emptyStateEl.isConnected) {
         emptyStateEl.remove();
       }
 
@@ -472,11 +574,11 @@
 
       if (!text && !pendingPhotoDataUrl) return;
 
-      appendMessage({
+      sendLiveMessage({
         author,
         text,
         photoUrl: pendingPhotoDataUrl,
-        mine: true
+        audioUrl: null
       });
 
       textInputEl.value = "";
@@ -500,6 +602,15 @@
       photoBtnEl.style.display = "";
     }
 
+    function blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    }
+
     async function startRecording() {
       if (!navigator.mediaDevices?.getUserMedia) {
         alert("Tu navegador no soporta grabación de audio aquí (requiere HTTPS o localhost).");
@@ -518,14 +629,14 @@
           }
         };
 
-        mediaRecorder.onstop = () => {
+        mediaRecorder.onstop = async () => {
           stream.getTracks().forEach((track) => track.stop());
 
           if (!cancelRecording && audioChunks.length > 0) {
             const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || "audio/webm" });
-            const audioUrl = URL.createObjectURL(blob);
+            const audioDataUrl = await blobToDataUrl(blob);
             const author = nickInputEl.value.trim() || "Yo";
-            appendMessage({ author, audioUrl, mine: true });
+            sendLiveMessage({ author, text: "", photoUrl: null, audioUrl: audioDataUrl });
           }
 
           audioChunks = [];
@@ -567,6 +678,8 @@
         resetRecorderUI();
       }
     });
+
+    connectSocket();
   </script>
 </body>
 </html>
